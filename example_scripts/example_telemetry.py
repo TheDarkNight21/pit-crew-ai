@@ -7,19 +7,34 @@ This script shows how to:
 3. Includes event types: lap, pit_in, pit_out, yellow_flag, vsc, safety_car, etc.
 """
 
+import sys
+from pathlib import Path
+import time
+import pandas as pd
+import requests
+import os
+from dotenv import load_dotenv
+
+# Add parent directory to path to import app modules
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from app.data_loader import (
+    fetch_data,
     fetch_sessions,
     fetch_laps,
     fetch_stints,
     fetch_pit_stop,
     fetch_drivers,
-    fetch_car_data,
     fetch_intervals,
     fetch_weather,
     fetch_race_control,
     fetch_position,
 )
 from app.process_data import create_telemetry_race_data
+
+# Load environment variables
+load_dotenv()
+BASE_API_URL = os.getenv("BASE_API_URL")
 
 # Configuration
 YEAR = 2025
@@ -28,9 +43,6 @@ MEETING_NAME = "Monaco Grand Prix - Monaco"
 SESSION_NAME = "Race"  # Can be: Practice 1, Practice 2, Practice 3, Qualifying, Sprint, Race
 
 def main():
-    # Import here to avoid issues if not installed
-    from app.data_loader import fetch_data
-
     print(f"\n{'='*60}")
     print(f"🏎️  OpenF1 Telemetry Data Loader")
     print(f"{'='*60}\n")
@@ -84,13 +96,88 @@ def main():
     pit_stops_df = fetch_pit_stop(session_key)
     print(f"      ✓ {len(pit_stops_df)} pit stops")
 
-    # Telemetry data (high frequency) - May not be available for all sessions
-    print("   → Fetching car telemetry (speed, throttle, brake, rpm, gear, drs)...")
-    car_data_df = fetch_car_data(session_key, raise_on_error=False)
-    if car_data_df.empty:
-        print(f"      ⚠️  Car telemetry not available for this session")
+    # Telemetry data (high frequency) - Fetch in speed ranges to avoid "too much data" error
+    print("\n   → Fetching car telemetry (speed, throttle, brake, rpm, gear, drs)...")
+    print("      (Fetching in speed ranges for Ferrari team only)\n")
+
+    # Identify Ferrari drivers
+    ferrari_drivers = drivers_df[drivers_df['team_name'].str.contains('Ferrari', case=False, na=False)]
+    ferrari_driver_numbers = sorted(ferrari_drivers['driver_number'].unique())
+
+    print(f"      Ferrari drivers: {', '.join(map(str, ferrari_driver_numbers))}\n")
+
+    # Speed ranges to split requests
+    speed_ranges = [
+        ("0-100", 0, 100),
+        ("100-200", 100, 200),
+        ("200-300", 200, 300),
+        ("300+", 300, 999)
+    ]
+
+    all_car_data = []
+
+    for idx, driver_num in enumerate(ferrari_driver_numbers, 1):
+        print(f"      [{idx}/{len(ferrari_driver_numbers)}] Driver {driver_num}:")
+        driver_data_chunks = []
+
+        for range_label, speed_min, speed_max in speed_ranges:
+            print(f"         {range_label} km/h...", end=" ", flush=True)
+
+            try:
+                # Fetch data with speed filter
+                url = f"{BASE_API_URL}car_data"
+                params = {
+                    "session_key": session_key,
+                    "driver_number": driver_num,
+                    f"speed>={speed_min}": "",
+                }
+                if speed_max < 999:
+                    params[f"speed<{speed_max}"] = ""
+
+                full_url = requests.Request('GET', url, params=params).prepare().url
+
+                # Show URL for first driver's first range
+                if idx == 1 and range_label == "0-100":
+                    print(f"\n            URL: {full_url}\n            ", end="")
+
+                response = requests.get(full_url)
+                response.raise_for_status()
+
+                chunk_data = pd.DataFrame(response.json())
+
+                if not chunk_data.empty:
+                    driver_data_chunks.append(chunk_data)
+                    print(f"✓ {len(chunk_data):,}")
+                else:
+                    print("⚠️ 0")
+
+            except Exception as e:
+                print(f"❌ {e}")
+
+            # Delay between speed ranges to avoid rate limiting
+            time.sleep(2)
+
+        # Combine all speed ranges for this driver
+        if driver_data_chunks:
+            driver_car_data = pd.concat(driver_data_chunks, ignore_index=True)
+            # Remove duplicates if any
+            driver_car_data = driver_car_data.drop_duplicates()
+            all_car_data.append(driver_car_data)
+            print(f"         Total: {len(driver_car_data):,} samples\n")
+        else:
+            print(f"         Total: 0 samples\n")
+
+        # Rate limit: wait 3 seconds between drivers
+        if idx < len(ferrari_driver_numbers):
+            time.sleep(3)
+
+    # Combine all driver data
+    if all_car_data:
+        car_data_df = pd.concat(all_car_data, ignore_index=True)
+        print(f"\n      ✓ Total: {len(car_data_df):,} telemetry samples (~3.7 Hz)")
     else:
-        print(f"      ✓ {len(car_data_df)} telemetry samples (~3.7 Hz)")
+        car_data_df = pd.DataFrame()
+        print(f"\n      ⚠️  Car telemetry not available for this session")
 
     # Gap/interval data - Only available for race sessions
     print("   → Fetching intervals (gaps between cars)...")

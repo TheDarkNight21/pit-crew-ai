@@ -303,11 +303,13 @@ def create_telemetry_race_data(
         lambda x: x - x.min() if x.notna().any() else np.nan
     )
 
-    # Select lap columns
-    lap_events = laps[[
+    # Select lap columns (only those that exist)
+    lap_columns_wanted = [
         "timestamp", "event_type", "driver_number", "lap_number",
         "lap_duration", "is_pit_out_lap", "position", "delta_vs_best_lap"
-    ]].copy()
+    ]
+    lap_columns_available = [col for col in lap_columns_wanted if col in laps.columns]
+    lap_events = laps[lap_columns_available].copy()
 
     # ========== Process Race Control Events ==========
     race_control_events = pd.DataFrame()
@@ -378,6 +380,9 @@ def create_telemetry_race_data(
         pit_events
     ], ignore_index=True, sort=False)
 
+    # Filter out rows with null timestamps (shouldn't happen, but just in case)
+    all_events = all_events.dropna(subset=["timestamp"])
+
     all_events = all_events.sort_values("timestamp").reset_index(drop=True)
     all_events["event_id"] = range(len(all_events))
 
@@ -390,17 +395,28 @@ def create_telemetry_race_data(
         car_data["driver_number"] = car_data["driver_number"].astype(str)
         car_data["timestamp"] = pd.to_datetime(car_data["date"], format='ISO8601')
 
-        # For each event, find the nearest car data sample
         print(f"  ⚙️  Merging {len(car_data)} car telemetry samples...")
-        all_events = pd.merge_asof(
-            all_events.sort_values("timestamp"),
-            car_data[["timestamp", "driver_number", "speed", "throttle", "brake",
-                     "rpm", "n_gear", "drs"]].sort_values("timestamp"),
-            on="timestamp",
-            by="driver_number",
-            direction="nearest",
-            tolerance=pd.Timedelta(seconds=5)
-        )
+
+        # Only merge car data for events with driver numbers
+        has_driver = all_events["driver_number"].notna() & (all_events["driver_number"] != "")
+        events_with_driver = all_events[has_driver].copy()
+        events_without_driver = all_events[~has_driver].copy()
+
+        if not events_with_driver.empty:
+            events_with_driver = pd.merge_asof(
+                events_with_driver.sort_values("timestamp"),
+                car_data[["timestamp", "driver_number", "speed", "throttle", "brake",
+                         "rpm", "n_gear", "drs"]].sort_values("timestamp"),
+                on="timestamp",
+                by="driver_number",
+                direction="nearest",
+                tolerance=pd.Timedelta(seconds=5)
+            )
+
+            # Recombine all events
+            all_events = pd.concat([events_with_driver, events_without_driver], ignore_index=True)
+            all_events = all_events.sort_values("timestamp").reset_index(drop=True)
+
         print(f"  ✓ Car telemetry merged")
 
     # ========== Add Interval/Gap Data ==========
@@ -410,21 +426,37 @@ def create_telemetry_race_data(
         intervals["timestamp"] = pd.to_datetime(intervals["date"], format='ISO8601')
 
         print(f"  📊 Merging {len(intervals)} interval samples...")
-        all_events = pd.merge_asof(
-            all_events.sort_values("timestamp"),
-            intervals[["timestamp", "driver_number", "gap_to_leader", "interval"]].sort_values("timestamp"),
-            on="timestamp",
-            by="driver_number",
-            direction="nearest",
-            tolerance=pd.Timedelta(seconds=10)
-        )
 
-        # Rename interval to gap_to_car_ahead for clarity
-        all_events = all_events.rename(columns={"interval": "gap_to_car_ahead"})
+        # Split events into those with and without driver_number
+        # (race control events may not have driver_number)
+        has_driver = all_events["driver_number"].notna() & (all_events["driver_number"] != "")
+        events_with_driver = all_events[has_driver].copy()
+        events_without_driver = all_events[~has_driver].copy()
 
-        # Calculate gap_to_car_behind
-        all_events = all_events.sort_values(["timestamp", "position"])
-        all_events["gap_to_car_behind"] = all_events.groupby("timestamp")["gap_to_car_ahead"].shift(-1)
+        if not events_with_driver.empty:
+            # Merge intervals only for events with driver numbers
+            valid_intervals = intervals[["timestamp", "driver_number", "gap_to_leader", "interval"]].dropna(subset=["timestamp", "driver_number"])
+
+            events_with_driver = pd.merge_asof(
+                events_with_driver.sort_values("timestamp"),
+                valid_intervals.sort_values("timestamp"),
+                on="timestamp",
+                by="driver_number",
+                direction="nearest",
+                tolerance=pd.Timedelta(seconds=10)
+            )
+
+            # Rename interval to gap_to_car_ahead for clarity
+            events_with_driver = events_with_driver.rename(columns={"interval": "gap_to_car_ahead"})
+
+            # Calculate gap_to_car_behind (only if position column exists)
+            if "position" in events_with_driver.columns:
+                events_with_driver = events_with_driver.sort_values(["timestamp", "position"])
+                events_with_driver["gap_to_car_behind"] = events_with_driver.groupby("timestamp")["gap_to_car_ahead"].shift(-1)
+
+            # Recombine all events
+            all_events = pd.concat([events_with_driver, events_without_driver], ignore_index=True)
+            all_events = all_events.sort_values("timestamp").reset_index(drop=True)
 
         print(f"  ✓ Gap data merged")
 
@@ -454,14 +486,26 @@ def create_telemetry_race_data(
         # Only use position data if we don't already have it from laps
         if "position" not in all_events.columns or all_events["position"].isna().all():
             print(f"  🏁 Merging {len(positions)} position samples...")
-            all_events = pd.merge_asof(
-                all_events.sort_values("timestamp"),
-                positions[["timestamp", "driver_number", "position"]].sort_values("timestamp"),
-                on="timestamp",
-                by="driver_number",
-                direction="nearest",
-                tolerance=pd.Timedelta(seconds=5)
-            )
+
+            # Only merge position for events with driver numbers
+            has_driver = all_events["driver_number"].notna() & (all_events["driver_number"] != "")
+            events_with_driver = all_events[has_driver].copy()
+            events_without_driver = all_events[~has_driver].copy()
+
+            if not events_with_driver.empty:
+                events_with_driver = pd.merge_asof(
+                    events_with_driver.sort_values("timestamp"),
+                    positions[["timestamp", "driver_number", "position"]].sort_values("timestamp"),
+                    on="timestamp",
+                    by="driver_number",
+                    direction="nearest",
+                    tolerance=pd.Timedelta(seconds=5)
+                )
+
+                # Recombine all events
+                all_events = pd.concat([events_with_driver, events_without_driver], ignore_index=True)
+                all_events = all_events.sort_values("timestamp").reset_index(drop=True)
+
             print(f"  ✓ Position data merged")
 
     # ========== Add Stint/Tire Data ==========

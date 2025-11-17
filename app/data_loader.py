@@ -8,7 +8,7 @@ load_dotenv()
 BASE_URL = os.getenv("BASE_API_URL")
 
 
-def fetch_data(endpoint, params=None, raise_on_error=True):
+def fetch_data(endpoint, params=None, raise_on_error=True, debug=False):
     """
     Fetch data from the OpenF1 API and return it as a DataFrame.
 
@@ -16,6 +16,7 @@ def fetch_data(endpoint, params=None, raise_on_error=True):
         endpoint (str): API endpoint (e.g., "meetings", "sessions").
         params (dict): Optional query parameters for the API.
         raise_on_error (bool): If False, return empty DataFrame on error instead of raising.
+        debug (bool): If True, print the URL being requested.
 
     Returns:
         pd.DataFrame: DataFrame containing the API response data.
@@ -31,6 +32,9 @@ def fetch_data(endpoint, params=None, raise_on_error=True):
 
     url = f"{BASE_URL}{endpoint}"
     full_url = requests.Request('GET', url, params=params).prepare().url
+
+    if debug:
+        print(f"      URL: {full_url}")
 
     try:
         response = requests.get(full_url)
@@ -101,7 +105,7 @@ def fetch_drivers(session_key):
 
 
 #@st.cache_data
-def fetch_car_data(session_key, driver_number=None, raise_on_error=False):
+def fetch_car_data(session_key, driver_number=None, raise_on_error=False, debug=False):
     """
     Fetches car telemetry data including speed, throttle, brake, RPM, gear, and DRS.
     Sampled at approximately 3.7 Hz.
@@ -110,6 +114,7 @@ def fetch_car_data(session_key, driver_number=None, raise_on_error=False):
         session_key: Session identifier
         driver_number: Optional driver number to filter (can be int or str)
         raise_on_error: If False, returns empty DataFrame when data unavailable
+        debug: If True, print the URL being requested
 
     Returns:
         DataFrame with columns: date, driver_number, speed, throttle, brake,
@@ -122,7 +127,7 @@ def fetch_car_data(session_key, driver_number=None, raise_on_error=False):
     params = {"session_key": session_key}
     if driver_number is not None:
         params["driver_number"] = driver_number
-    return fetch_data("car_data", params, raise_on_error=raise_on_error)
+    return fetch_data("car_data", params, raise_on_error=raise_on_error, debug=debug)
 
 
 #@st.cache_data
