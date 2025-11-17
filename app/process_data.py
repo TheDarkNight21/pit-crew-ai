@@ -1,6 +1,7 @@
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import os
+import numpy as np
 
 
 def create_streamable_race_data(
@@ -235,3 +236,303 @@ def get_race_summary(csv_path: str) -> Dict:
     }
 
     return summary
+
+
+def create_telemetry_race_data(
+    laps_df: pd.DataFrame,
+    drivers_df: pd.DataFrame,
+    car_data_df: Optional[pd.DataFrame] = None,
+    intervals_df: Optional[pd.DataFrame] = None,
+    weather_df: Optional[pd.DataFrame] = None,
+    race_control_df: Optional[pd.DataFrame] = None,
+    position_df: Optional[pd.DataFrame] = None,
+    stints_df: Optional[pd.DataFrame] = None,
+    pit_stops_df: Optional[pd.DataFrame] = None,
+    output_path: str = "race_telemetry_data.csv"
+) -> pd.DataFrame:
+    """
+    Create comprehensive telemetry-enriched race data combining lap events with
+    high-frequency car data, weather, race control events, and derived metrics.
+
+    This function creates a detailed CSV suitable for machine learning and race
+    analysis by merging multiple data sources at different sampling rates.
+
+    Args:
+        laps_df: Lap timing data (one row per lap)
+        drivers_df: Driver metadata
+        car_data_df: Car telemetry (speed, throttle, brake, rpm, gear, drs) ~3.7 Hz
+        intervals_df: Gap data (gap_to_leader, interval) ~0.25 Hz
+        weather_df: Track conditions (temps, wind, rainfall) ~0.017 Hz
+        race_control_df: Flags, safety cars, penalties
+        position_df: Position changes
+        stints_df: Tire stint information
+        pit_stops_df: Pit stop events
+        output_path: Output CSV file path
+
+    Returns:
+        pd.DataFrame: Combined telemetry data sorted chronologically
+
+    Output includes:
+        - All lap-based fields (lap_number, lap_duration, position, etc.)
+        - Car telemetry (speed, throttle, brake, rpm, gear, drs)
+        - Gap data (gap_to_leader, gap_to_car_ahead)
+        - Weather (air_temp, track_temp, rainfall, humidity, wind)
+        - Track status derived from race control
+        - Tire information (compound, age)
+        - Event types (lap, pit_in, pit_out, yellow_flag, vsc, safety_car, etc.)
+        - Derived metrics (delta_vs_best_lap, gap_to_car_behind)
+    """
+
+    print(f"\n🏎️  Creating telemetry-enriched race data...")
+
+    # Prepare driver lookup
+    drivers = drivers_df.copy()
+    drivers["driver_number"] = drivers["driver_number"].astype(str)
+    driver_info = drivers[[
+        "driver_number", "name_acronym", "team_name", "team_colour"
+    ]].rename(columns={"name_acronym": "driver_name"})
+
+    # ========== Process Lap Events ==========
+    laps = laps_df.copy()
+    laps["driver_number"] = laps["driver_number"].astype(str)
+    laps["timestamp"] = pd.to_datetime(laps["date_start"], format='ISO8601')
+    laps["event_type"] = "lap"
+
+    # Calculate delta vs best lap for each driver
+    laps["delta_vs_best_lap"] = laps.groupby("driver_number")["lap_duration"].transform(
+        lambda x: x - x.min() if x.notna().any() else np.nan
+    )
+
+    # Select lap columns
+    lap_events = laps[[
+        "timestamp", "event_type", "driver_number", "lap_number",
+        "lap_duration", "is_pit_out_lap", "position", "delta_vs_best_lap"
+    ]].copy()
+
+    # ========== Process Race Control Events ==========
+    race_control_events = pd.DataFrame()
+    if race_control_df is not None and not race_control_df.empty:
+        rc = race_control_df.copy()
+        rc["timestamp"] = pd.to_datetime(rc["date"], format='ISO8601')
+        rc["driver_number"] = rc["driver_number"].astype(str).fillna("")
+
+        # Map race control messages to event types
+        def categorize_race_control_event(row):
+            msg = str(row.get("message", "")).lower()
+            flag = str(row.get("flag", "")).lower()
+            category = str(row.get("category", "")).lower()
+
+            if "yellow" in flag or "yellow" in msg:
+                return "yellow_flag"
+            elif "green" in flag or "green" in msg:
+                return "green_flag"
+            elif "red" in flag or "red" in msg:
+                return "red_flag"
+            elif "vsc" in msg or "virtual safety car" in msg:
+                return "vsc" if "deployed" in msg or "start" in msg else "vsc_end"
+            elif "safety car" in msg:
+                return "safety_car" if "deployed" in msg else "safety_car_end"
+            elif "rain" in msg:
+                return "rain_start" if "start" in msg or "detected" in msg else "rain_end"
+            else:
+                return "race_control"
+
+        rc["event_type"] = rc.apply(categorize_race_control_event, axis=1)
+
+        race_control_events = rc[[
+            "timestamp", "event_type", "driver_number", "lap_number",
+            "message", "flag", "category", "scope", "sector"
+        ]].copy()
+
+        print(f"  ✓ Processed {len(race_control_events)} race control events")
+
+    # ========== Process Pit Stop Events ==========
+    pit_events = pd.DataFrame()
+    if pit_stops_df is not None and not pit_stops_df.empty:
+        pits = pit_stops_df.copy()
+        pits["driver_number"] = pits["driver_number"].astype(str)
+        pits["timestamp"] = pd.to_datetime(pits["date"], format='ISO8601')
+
+        # Create pit_in and pit_out events
+        pit_in = pits.copy()
+        pit_in["event_type"] = "pit_in"
+
+        pit_out = pits.copy()
+        pit_out["event_type"] = "pit_out"
+        # Pit out timestamp = pit in + pit duration
+        pit_out["timestamp"] = pit_out["timestamp"] + pd.to_timedelta(
+            pit_out["pit_duration"], unit='s'
+        )
+
+        pit_events = pd.concat([pit_in, pit_out], ignore_index=True)
+        pit_events = pit_events[[
+            "timestamp", "event_type", "driver_number", "lap_number", "pit_duration"
+        ]].copy()
+
+        print(f"  ✓ Processed {len(pit_stops_df)} pit stops ({len(pit_events)} events)")
+
+    # ========== Combine All Events ==========
+    all_events = pd.concat([
+        lap_events,
+        race_control_events,
+        pit_events
+    ], ignore_index=True, sort=False)
+
+    all_events = all_events.sort_values("timestamp").reset_index(drop=True)
+    all_events["event_id"] = range(len(all_events))
+
+    # Merge driver info
+    all_events = all_events.merge(driver_info, on="driver_number", how="left")
+
+    # ========== Add Telemetry Data via Time-Based Merge ==========
+    if car_data_df is not None and not car_data_df.empty:
+        car_data = car_data_df.copy()
+        car_data["driver_number"] = car_data["driver_number"].astype(str)
+        car_data["timestamp"] = pd.to_datetime(car_data["date"], format='ISO8601')
+
+        # For each event, find the nearest car data sample
+        print(f"  ⚙️  Merging {len(car_data)} car telemetry samples...")
+        all_events = pd.merge_asof(
+            all_events.sort_values("timestamp"),
+            car_data[["timestamp", "driver_number", "speed", "throttle", "brake",
+                     "rpm", "n_gear", "drs"]].sort_values("timestamp"),
+            on="timestamp",
+            by="driver_number",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=5)
+        )
+        print(f"  ✓ Car telemetry merged")
+
+    # ========== Add Interval/Gap Data ==========
+    if intervals_df is not None and not intervals_df.empty:
+        intervals = intervals_df.copy()
+        intervals["driver_number"] = intervals["driver_number"].astype(str)
+        intervals["timestamp"] = pd.to_datetime(intervals["date"], format='ISO8601')
+
+        print(f"  📊 Merging {len(intervals)} interval samples...")
+        all_events = pd.merge_asof(
+            all_events.sort_values("timestamp"),
+            intervals[["timestamp", "driver_number", "gap_to_leader", "interval"]].sort_values("timestamp"),
+            on="timestamp",
+            by="driver_number",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=10)
+        )
+
+        # Rename interval to gap_to_car_ahead for clarity
+        all_events = all_events.rename(columns={"interval": "gap_to_car_ahead"})
+
+        # Calculate gap_to_car_behind
+        all_events = all_events.sort_values(["timestamp", "position"])
+        all_events["gap_to_car_behind"] = all_events.groupby("timestamp")["gap_to_car_ahead"].shift(-1)
+
+        print(f"  ✓ Gap data merged")
+
+    # ========== Add Weather Data ==========
+    if weather_df is not None and not weather_df.empty:
+        weather = weather_df.copy()
+        weather["timestamp"] = pd.to_datetime(weather["date"], format='ISO8601')
+
+        print(f"  🌤️  Merging {len(weather)} weather samples...")
+        # Weather applies to all drivers, so merge without 'by' parameter
+        all_events = pd.merge_asof(
+            all_events.sort_values("timestamp"),
+            weather[["timestamp", "air_temperature", "track_temperature",
+                    "humidity", "pressure", "rainfall", "wind_speed", "wind_direction"]].sort_values("timestamp"),
+            on="timestamp",
+            direction="nearest",
+            tolerance=pd.Timedelta(minutes=2)
+        )
+        print(f"  ✓ Weather data merged")
+
+    # ========== Add Position Data (Higher Granularity) ==========
+    if position_df is not None and not position_df.empty:
+        positions = position_df.copy()
+        positions["driver_number"] = positions["driver_number"].astype(str)
+        positions["timestamp"] = pd.to_datetime(positions["date"], format='ISO8601')
+
+        # Only use position data if we don't already have it from laps
+        if "position" not in all_events.columns or all_events["position"].isna().all():
+            print(f"  🏁 Merging {len(positions)} position samples...")
+            all_events = pd.merge_asof(
+                all_events.sort_values("timestamp"),
+                positions[["timestamp", "driver_number", "position"]].sort_values("timestamp"),
+                on="timestamp",
+                by="driver_number",
+                direction="nearest",
+                tolerance=pd.Timedelta(seconds=5)
+            )
+            print(f"  ✓ Position data merged")
+
+    # ========== Add Stint/Tire Data ==========
+    if stints_df is not None and not stints_df.empty:
+        stints = stints_df.copy()
+        stints["driver_number"] = stints["driver_number"].astype(str)
+
+        # Merge tire info based on lap number
+        def get_tire_info(row):
+            if pd.isna(row.get("lap_number")):
+                return pd.Series({"compound": None, "tyre_age_at_start": None})
+
+            driver_stints = stints[stints["driver_number"] == row["driver_number"]]
+            matching = driver_stints[
+                (driver_stints["lap_start"] <= row["lap_number"]) &
+                (driver_stints["lap_end"] >= row["lap_number"])
+            ]
+            if not matching.empty:
+                stint = matching.iloc[0]
+                return pd.Series({
+                    "compound": stint["compound"],
+                    "tyre_age_at_start": stint["tyre_age_at_start"]
+                })
+            return pd.Series({"compound": None, "tyre_age_at_start": None})
+
+        print(f"  🛞 Adding tire stint information...")
+        tire_data = all_events.apply(get_tire_info, axis=1)
+        all_events = pd.concat([all_events, tire_data], axis=1)
+        print(f"  ✓ Tire data added")
+
+    # ========== Derive Track Status ==========
+    # Create track_status field based on race control events
+    all_events["track_status"] = "green"
+
+    if not race_control_events.empty:
+        for idx, row in all_events.iterrows():
+            # Find the most recent race control event before this timestamp
+            prior_events = all_events[
+                (all_events["timestamp"] <= row["timestamp"]) &
+                (all_events["event_type"].isin(["yellow_flag", "green_flag", "vsc",
+                                                 "vsc_end", "safety_car", "safety_car_end"]))
+            ]
+            if not prior_events.empty:
+                last_event = prior_events.iloc[-1]
+                if last_event["event_type"] in ["yellow_flag"]:
+                    all_events.at[idx, "track_status"] = "yellow"
+                elif last_event["event_type"] in ["vsc"]:
+                    all_events.at[idx, "track_status"] = "vsc"
+                elif last_event["event_type"] in ["safety_car"]:
+                    all_events.at[idx, "track_status"] = "safety_car"
+
+    # ========== Final Cleanup ==========
+    # Sort by timestamp
+    all_events = all_events.sort_values("timestamp").reset_index(drop=True)
+
+    # Convert timestamp to string for CSV
+    all_events["timestamp"] = all_events["timestamp"].dt.strftime('%Y-%m-%d %H:%M:%S.%f')
+
+    # Save to CSV
+    all_events.to_csv(output_path, index=False)
+
+    # Print summary
+    print(f"\n✅ Created telemetry race data: {output_path}")
+    print(f"  - Total events: {len(all_events)}")
+    print(f"  - Event types: {all_events['event_type'].value_counts().to_dict()}")
+    print(f"  - Drivers: {all_events['driver_number'].nunique()}")
+    print(f"  - Columns: {len(all_events.columns)}")
+    print(f"  - Available fields:")
+    for col in all_events.columns:
+        non_null = all_events[col].notna().sum()
+        if non_null > 0:
+            print(f"    • {col}: {non_null}/{len(all_events)} records")
+
+    return all_events
